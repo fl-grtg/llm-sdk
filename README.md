@@ -240,14 +240,14 @@ response = llm.response(
 - `max_retries=3` globally on `LLM(...)` or per call
 - `reasoning_effort="high"` where supported (`reasoning_budget=N` as token-budget alternative; mutually exclusive)
 - `temperature/top_p/max_tokens/stop/seed/user/tool_choice/store/extra_body` per call (`seed`/`stop` ignored with a warning in Responses mode)
-- `extra_body` bypasses validation (escape hatch); `model`/`messages`/`input`/`stream` are rejected. On `api.openai.com` reasoning models, `stop`/`temperature`/`top_p` are dropped and `max_tokens` maps to `max_completion_tokens`
+- `extra_body` for provider-specific fields (validated as JSON); `model`/`messages`/`input`/`stream` are rejected. On `api.openai.com` reasoning models, `stop`/`temperature`/`top_p` are dropped and `max_tokens` maps to `max_completion_tokens`
 - `schema_strict=False` relaxes the generated schema only (fewer `required`) – parsing stays strict
 - `LLMConfig(...)` + `LLM.from_config(config)` for config-object style; `default_stop_sequences=[...]`; `normalize_base_url=False` keeps `base_url` as given
 - `configure_debug_logging()` / `configure_quiet_logging()` for explicit log control (beyond `debug=True`)
 - `include_reasoning=False` to hide reasoning content (shown by default)
 - `max_image_side=8192` caps the longest image side (`None` disables, byte budget still applies)
 - `CustomReasoningPattern(...)` for custom `<think>`-style parsing
-- `verbose=True` for stream stats (incl. `stop_reason`); without server `usage`, `tokens` falls back to chunk count
+- `verbose=True` for stream stats (incl. `stop_reason`); without server `usage`, `tokens` falls back to chunk count (`tokens_is_estimated=True`)
 - `debug=True` for SDK debug logs (quiet by default)
 - `stop_reason`: `"stop" | "length" | "tool_calls" | "content_filter" | "refusal"` (plus `"failed"`/`"cancelled"`/`"incomplete"` in Responses mode)
 - message helpers: `system_message(...)`, `user_message(...)`, `assistant_message(...)`, `tool_result(...)`

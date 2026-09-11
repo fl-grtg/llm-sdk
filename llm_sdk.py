@@ -136,7 +136,7 @@ def configure_debug_logging() -> None:
 DEFAULT_API_KEY: Final[str] = "lm-studio"
 DEFAULT_BASE_URL: Final[str] = "http://localhost:1234/v1"
 DEFAULT_TIMEOUT: Final[float] = 300.0
-__version__: Final[str] = "2.0.0"
+__version__: Final[str] = "2.0.1"
 
 MessageList = list[dict[str, Any]]
 
@@ -454,6 +454,8 @@ def _resolve_messages(
 ) -> MessageList:
     if system is not None and not isinstance(system, str):
         raise ConfigurationError("system must be a string")
+    if isinstance(system, str) and not system.strip():
+        system = None  # empty prompt is omitted, never sent
     if input is not None and not isinstance(input, str):
         raise ConfigurationError("input must be a string")
     if messages is not None and input is not None:
@@ -926,6 +928,7 @@ class UserMessage(TypedDict):
 class VerboseInfo(TypedDict, total=False):
     """Typed dictionary for verbose information."""
     tokens: int
+    tokens_is_estimated: bool
     chunks: int
     tokens_per_second: float
     latency: Optional[float]
@@ -1105,9 +1108,11 @@ class ReasoningParser:
 
     _BASE_START_TAGS: ClassVar[tuple[str, ...]] = (
         "<think>", "<thinking>", "[THINK]", "<thought>",
+        "<think >", "<thinking >", "<thought >",
     )
     _BASE_END_TAGS: ClassVar[tuple[str, ...]] = (
         "</think>", "</thinking>", "[/THINK]", "</thought>",
+        "</think >", "</thinking >", "</thought >",
     )
 
     def __init__(self, custom_token: Optional[CustomReasoningPattern] = None):
@@ -3896,6 +3901,7 @@ class _ChatStreamState:
 
         verbose_info: VerboseInfo = {
             "tokens": tokens,
+            "tokens_is_estimated": self.completion_tokens is None,
             "chunks": self.chunks,
             "tokens_per_second": tokens_per_second,
             "latency": self.latency,
@@ -3950,9 +3956,9 @@ class LLM:
         default_stop_sequences: Global non-empty stop strings.
         timeout: Request timeout in seconds (positive finite number;
             ``None`` disables it — not recommended).
-        extra_body: Provider-specific fields merged last (bypasses SDK
-            validation; may override request fields, except
-            ``model``/``messages``/``input``/``stream`` which are rejected).
+        extra_body: Provider-specific fields merged last (validated as
+            JSON; ``model``/``messages``/``input``/``stream`` are rejected,
+            use the explicit parameters instead).
         use_responses_api: Use the Responses API shape instead of chat.
         default_headers: Extra headers (never logged).
         max_retries: Default retry count (``int >= 0``), per-call
@@ -3961,10 +3967,8 @@ class LLM:
         debug: Enable this SDK's debug logs (third-party HTTP chatter
             stays at WARNING to avoid leaking ``Authorization`` headers).
             Note: this sets the SDK logger level process-wide, so one
-            ``debug=True`` instance affects all instances. The WARNING pin
-            for httpx/openai/httpcore is applied on every construction
-            (even ``debug=False``), so other libraries' debug logging for
-            those packages is muted while this SDK is in use.
+            ``debug=True`` instance affects all instances. With
+            ``debug=False`` third-party loggers are left untouched.
         max_image_side: Longest image side in px (``None`` disables;
             byte budget still applies).
 
@@ -4024,10 +4028,10 @@ class LLM:
         )
         if debug:
             logger.setLevel(logging.DEBUG)
-        # Third-party HTTP chatter stays at WARNING in both modes: at DEBUG
-        # httpx would log headers including the Authorization key.
-        for logger_name in ("httpx", "openai", "httpcore"):
-            logging.getLogger(logger_name).setLevel(logging.WARNING)
+            # Third-party HTTP chatter stays at WARNING: at DEBUG httpx
+            # would log headers including the Authorization key.
+            for logger_name in ("httpx", "openai", "httpcore"):
+                logging.getLogger(logger_name).setLevel(logging.WARNING)
 
         self._api_base = _resolve_api_base(
             self._config.base_url, normalize=normalize_base_url
@@ -5156,6 +5160,7 @@ class LLM:
 
         verbose_info: VerboseInfo = {
             "tokens": tokens,
+            "tokens_is_estimated": completion_tokens is None,
             "chunks": stream_tokens,
             "tokens_per_second": tokens_per_second,
             "latency": latency,

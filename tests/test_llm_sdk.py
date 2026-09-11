@@ -3730,13 +3730,17 @@ class PostAuditRegressionTests(unittest.TestCase):
             with self.subTest(base_url=bad), self.assertRaises(ConfigurationError):
                 LLM(model="test", base_url=bad)
 
-    def test_empty_system_message_is_respected(self):
+    def test_empty_system_message_is_omitted(self):
         from llm_sdk import _resolve_messages
 
         resolved = _resolve_messages(
             messages=[{"role": "user", "content": "hi"}], system=""
         )
-        self.assertEqual(resolved[0], {"role": "system", "content": ""})
+        self.assertEqual(resolved, [{"role": "user", "content": "hi"}])
+        resolved_ws = _resolve_messages(
+            messages=[{"role": "user", "content": "hi"}], system="   "
+        )
+        self.assertEqual(resolved_ws, [{"role": "user", "content": "hi"}])
 
     def test_assistant_message_keeps_falsy_structured_answers(self):
         from llm_sdk import assistant_message
