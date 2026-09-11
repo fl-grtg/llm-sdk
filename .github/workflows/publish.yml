@@ -11,7 +11,7 @@ jobs:
   validate:
     name: Validate release (tests + lint)
     runs-on: ubuntu-latest
-    if: github.repository == 'flgaertig/llm-sdk'
+    if: github.repository == 'fl-grtg/llm-sdk'
     timeout-minutes: 15
     steps:
     - name: Checkout source code
@@ -35,7 +35,7 @@ jobs:
     needs: [validate]
     name: Build and publish Python package
     runs-on: ubuntu-latest
-    if: github.repository == 'flgaertig/llm-sdk'
+    if: github.repository == 'fl-grtg/llm-sdk'
     timeout-minutes: 20
     environment: pypi
     permissions:
