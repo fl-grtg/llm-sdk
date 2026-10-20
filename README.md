@@ -226,7 +226,6 @@ Set `LLM_MODEL`, optionally `LLM_BASE_URL` and `LLM_API_KEY`, then run e.g.
 `python examples/local.py`. Never commit API keys.
 
 See [compatibility and manual checks](https://github.com/fl-grtg/llm-sdk/blob/main/COMPATIBILITY.md) and [release notes](https://github.com/fl-grtg/llm-sdk/blob/main/CHANGELOG.md).
-Measured live results and endpoint limitations are in [LIVE_TEST_REPORT.md](https://github.com/fl-grtg/llm-sdk/blob/main/LIVE_TEST_REPORT.md).
 Opt-in live contracts in `tests/test_live.py` exercise configured Chat and
 Responses endpoints, including tool replay, images, concurrency and cleanup.
 They are skipped unless `LLM_SDK_LIVE=1`; see COMPATIBILITY.md for configuration.

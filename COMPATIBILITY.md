@@ -72,9 +72,8 @@ Responses example in the README. Verify text, a function-tool round trip and
 structured output with the model you use. Do not assume that a successful
 Chat Completions call verifies Responses mode.
 
-Measured live checks are recorded in [LIVE_TEST_REPORT.md](LIVE_TEST_REPORT.md),
-including failures and endpoint limitations. Other model/endpoint combinations
-still require their own checks. Do not add private prompts or credentials.
+Each model/endpoint combination requires its own live checks, including output
+limits and stream termination. Do not add private prompts or credentials.
 
 ## Deliberate boundaries
 
