@@ -26,6 +26,8 @@ additional runtime dependencies.
 - `usage` on every aggregated/final result, independent of `verbose`. Missing
   token counts stay `None`; chunk estimates never become total token counts.
 - HTTP contract tests for sync/async Chat and Responses requests and SSE streams.
+- Opt-in live endpoint contracts covering tools, schemas, images, async
+  concurrency, early closure, cancellation, timeouts, authentication and truncation.
 - Runnable local, streaming, structured-output and tool-dialog examples.
 - CI coverage for the minimum supported OpenAI dependency and Windows.
 
@@ -38,6 +40,8 @@ additional runtime dependencies.
   unresolvable function-call completions.
 - Separate different indexless tool names even when earlier arguments are incomplete.
 - Close the nested async Responses stream when the public generator is closed.
+- Reject unfinished empty/reasoning-only streams without an answer, completed
+  tool call, refusal or terminal status, instead of returning an empty result.
 - Accept `output_text` parts in Chat response content lists.
 - Respect explicit Responses `include` overrides when `store=False`.
 - Remove repeated schema preparation in aggregated calls; correct package URLs

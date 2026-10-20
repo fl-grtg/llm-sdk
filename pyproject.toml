@@ -43,6 +43,9 @@ Repository = "https://github.com/fl-grtg/llm-sdk"
 [tool.setuptools]
 py-modules = ["llm_sdk"]
 
+[tool.pytest.ini_options]
+markers = ["live: opt-in tests against configured real inference endpoints"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"

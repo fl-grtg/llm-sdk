@@ -198,10 +198,18 @@ when you need native resources or event types.
 - `extra_body` deep-merges provider options, last, and may override normal fields. `model`, `messages`, `input` and `stream` are reserved. Use it for endpoint-specific token-limit or reasoning fields when necessary.
 - Every final result has `usage` with `prompt_tokens`, `completion_tokens` and `total_tokens`. Missing counts are `None`; totals are derived only if both counts are known.
 - `verbose=True` adds stream statistics. Without server usage, `tokens` falls back to **chunk count**, flagged by `tokens_is_estimated=True`. Throughput includes consumer pauses; a one-chunk response uses full elapsed time. These figures are diagnostic, not billing data.
-- API failures raise `ModelRequestError` with available status, request ID and body; configuration, schema and media errors have separate exception types.
+- API failures raise `ModelRequestError` with available status, request ID and body; configuration, schema and media errors have separate exception types. A stream ending without an answer, completed tool call, refusal or terminal status also raises `ModelRequestError`, rather than returning an apparently successful empty response.
 - Logging is quiet by default. `debug=True` changes the SDK logger process-wide. `configure_debug_logging()` / `configure_quiet_logging()` are explicit logging helpers.
 - `LLMConfig` / `LLM.from_config` support config-object construction. Config values are copied at construction.
 - `list_models` / `async_list_models` exist on clients and as standalone functions. Use `raise_on_error=True` when listing must fail rather than log and return the fallback.
+
+For a service, keep one client in its event loop and close it through
+`async with` / `aclose()` before the loop shuts down. Reuse across already-closed
+loops has best-effort cleanup; it is not a substitute for a proper lifecycle.
+Handle `ModelRequestError` and check `stop_reason`: `length` means truncated,
+and an absent stop reason does not establish a complete answer. Do not treat
+partial streamed text as a committed business result. Token limits must be
+honored by the endpoint; the SDK cannot enforce a provider's billing limit.
 
 ## Development and maintenance
 
@@ -218,6 +226,10 @@ Set `LLM_MODEL`, optionally `LLM_BASE_URL` and `LLM_API_KEY`, then run e.g.
 `python examples/local.py`. Never commit API keys.
 
 See [compatibility and manual checks](COMPATIBILITY.md) and [release notes](CHANGELOG.md).
+Measured live results and endpoint limitations are in [LIVE_TEST_REPORT.md](LIVE_TEST_REPORT.md).
+Opt-in live contracts in `tests/test_live.py` exercise configured Chat and
+Responses endpoints, including tool replay, images, concurrency and cleanup.
+They are skipped unless `LLM_SDK_LIVE=1`; see COMPATIBILITY.md for configuration.
 The intended scope is stable inference helpers. Maintenance focuses on bugs,
 dependencies and demonstrated endpoint compatibility issues. New provider
 frameworks and agent orchestration are outside that scope.

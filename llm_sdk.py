@@ -3908,6 +3908,9 @@ class _ChatStreamState:
         # fail JSON parsing of an (correctly) empty answer.
         pending_calls = self._tool_handler.finalize()
 
+        if self.stop_reason is None and not (self.answer.strip() or self.refusal or self._tool_handler.get_all_calls()):
+            raise ModelRequestError("Model stream ended before an answer, completed tool call or terminal status was received")
+
         answer: Any = self.answer
         if self._structured_output:
             answer = _parse_structured_output(
@@ -5088,6 +5091,9 @@ class LLM:
 
         if state["refusal"]:
             state["stop_reason"] = "refusal"
+
+        if state["stop_reason"] is None and not (state["answer"].strip() or state["refusal"] or state["completed_tool_calls"]):
+            raise ModelRequestError("Responses stream ended before an answer, completed tool call or terminal status was received")
 
         answer: Any = state["answer"]
         if structured_output:

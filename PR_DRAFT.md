@@ -34,7 +34,13 @@ See CHANGELOG.md for migration details.
 
 ## Validation
 
-Local validation results are recorded with the commit handoff. Automated protocol
-tests use real OpenAI/HTTPX clients and in-process mock responses; live model
-quality and live provider/version compatibility require the documented manual
-checks. No live inference or publication is part of this change.
+Automated protocol tests use real OpenAI/HTTPX clients and in-process mock
+responses. Opt-in live contracts also exercise Google Gemma Chat Completions
+and GPT-6 Luna through a local Responses proxy. The live checks exposed
+unfinished reasoning-only streams, which now raise `ModelRequestError` instead
+of returning empty results without a terminal status. Regression tests preserve
+explicitly completed empty answers.
+
+See LIVE_TEST_REPORT.md for measured results and provider limitations, including
+a proxy that ignores output limits and Google's reasoning-sensitive stream behavior.
+No remote publication is part of this change.

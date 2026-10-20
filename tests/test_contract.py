@@ -162,6 +162,37 @@ def test_missing_usage_is_unknown_not_a_chunk_estimate(server, responses):
     assert result["usage"] == {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
 
 
+@pytest.mark.parametrize("responses", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("body", ["empty", "done_only", "unfinished_reasoning", "whitespace"])
+def test_empty_or_reasoning_only_unfinished_stream_raises(server, responses, asynchronous, stream, body):
+    if body == "empty":
+        server["body"] = ""
+    elif body == "done_only":
+        server["body"] = "data: [DONE]\n\n"
+    else:
+        text = "   " if body == "whitespace" else "<think>unfinished"
+        event = {"type": "response.output_text.delta", "delta": text} if responses else {
+            "choices": [{"delta": {"content": text}}],
+        }
+        server["body"] = f"data: {json.dumps(event)}\n\n"
+    with pytest.raises(sdk.ModelRequestError, match="stream ended before"):
+        request_model(responses, asynchronous, stream)
+
+
+@pytest.mark.parametrize("responses", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_explicitly_completed_empty_answer_is_preserved(server, responses, asynchronous, stream):
+    server["body"] = sse(responses, "")
+    result = request_model(responses, asynchronous, stream)
+    if stream:
+        result = next(e["content"] for e in result if e["type"] == "final")
+    assert result["answer"] == ""
+    assert result["stop_reason"] == "stop"
+
+
 def test_store_false_honors_explicit_includes_on_wire(server):
     server["body"] = sse(True, "hello")
     request_model(True, False, False, store=False, extra_body={"include": []})

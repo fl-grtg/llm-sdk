@@ -24,6 +24,30 @@ OpenAI 2.0.0 job. Passing CI does not certify untested provider versions.
 
 ## Manual checks before releasing endpoint compatibility changes
 
+For repeatable live tests, configure these environment variables for **each**
+prefix `LLM_LIVE_CHAT_` and `LLM_LIVE_RESPONSES_`:
+
+- `MODEL`: exact model ID.
+- `BASE_URL`: corresponding API base URL.
+- `API_KEY`: credential, loaded privately into the process environment.
+- `REASONING_EFFORT`: optional, only when supported by that endpoint/model.
+
+Then set `LLM_SDK_LIVE=1` and run:
+
+```sh
+python -m pytest tests/test_live.py -v --tb=line
+```
+
+These tests make real billable requests, use generated test content only, and
+disable retries by default to expose provider failures. Set
+`LLM_LIVE_MAX_RETRIES=3` to exercise the normal retry budget. Normal calls allow
+4096 output tokens for reasoning headroom; a separate 16-token case checks
+whether the endpoint enforces limits. They include a three-request async
+concurrency check and deliberate invalid-key/timeout/cancellation requests.
+Credentials are excluded from configuration representations; never enable
+HTTP debug logging or publish an environment file. Normal tests and CI skip
+these calls. Both configured endpoints are required for the full live suite.
+
 Install the checkout with `python -m pip install -e ".[dev,pillow]"`. Start
 your server and load an appropriate model. In PowerShell:
 
@@ -48,9 +72,9 @@ Responses example in the README. Verify text, a function-tool round trip and
 structured output with the model you use. Do not assume that a successful
 Chat Completions call verifies Responses mode.
 
-No live provider/version combination is certified by this document. Record
-actual live checks in release notes when performed; do not add private prompts
-or credentials.
+Measured live checks are recorded in [LIVE_TEST_REPORT.md](LIVE_TEST_REPORT.md),
+including failures and endpoint limitations. Other model/endpoint combinations
+still require their own checks. Do not add private prompts or credentials.
 
 ## Deliberate boundaries
 

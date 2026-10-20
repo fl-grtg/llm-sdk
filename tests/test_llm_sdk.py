@@ -4415,9 +4415,10 @@ class AuditFixTests(unittest.TestCase):
         self.assertEqual(out[0]["filename"], "doc.pdf")
 
     def test_responses_close_guards_do_not_mask_errors(self):
-        # A close() that raises must not mask the (absent) stream error:
-        # the generator simply ends instead of propagating close failures.
+        # A close() failure must not replace the incomplete-stream error.
         from types import SimpleNamespace
+
+        from llm_sdk import ModelRequestError
 
         llm = self._llm()
 
@@ -4430,11 +4431,12 @@ class AuditFixTests(unittest.TestCase):
         llm._client = SimpleNamespace(
             responses=SimpleNamespace(create=lambda **kw: BadClose())
         )
-        events = list(llm._stream_responses_sync(
-            [{"role": "user", "content": "hi"}],
-            None, None, None, None, False, True, False, None,
-        ))
-        self.assertTrue(all(e["type"] != "done" or True for e in events))
+        with self.assertLogs("llm_sdk", level="WARNING") as logs, self.assertRaisesRegex(ModelRequestError, "stream ended before"):
+            list(llm._stream_responses_sync(
+                [{"role": "user", "content": "hi"}],
+                None, None, None, None, False, True, False, None,
+            ))
+        self.assertTrue(any("Failed to close stream: boom" in line for line in logs.output))
 
     # -- modality top-level fields (detail / file_id / processing) --------
 
@@ -5392,7 +5394,7 @@ class AuditFixTests(unittest.TestCase):
         chunk = SimpleNamespace(
             usage=None,
             choices=[SimpleNamespace(
-                delta=SimpleNamespace(content="<think>open answer")
+                delta=SimpleNamespace(content="<think>open answer"), finish_reason="stop"
             )],
         )
         llm._client = SimpleNamespace(
@@ -5771,7 +5773,7 @@ class AuditFixTests(unittest.TestCase):
         chunk = SimpleNamespace(
             usage=None,
             choices=[SimpleNamespace(
-                delta=SimpleNamespace(content="<think>open answer")
+                delta=SimpleNamespace(content="<think>open answer"), finish_reason="stop"
             )],
         )
         llm._client = SimpleNamespace(
