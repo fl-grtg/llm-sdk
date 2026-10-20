@@ -33,6 +33,11 @@ additional runtime dependencies.
 
 ### Fixed
 
+- Reject open Pydantic object schemas locally in strict mode, including nested
+  definitions; `schema_strict=False` remains available for non-strict endpoints.
+- Remove obsolete discriminator mappings when inlining embedded schema references.
+- Keep different idless tools separate when a server reuses the same index.
+- Use absolute README links so documentation and examples also open from PyPI.
 - Preserve Pillow's process-wide pixel limit.
 - Reject images still exceeding the send budget after resizing.
 - Reject Responses tool history with missing call IDs or function names locally.

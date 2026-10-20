@@ -132,7 +132,7 @@ validate arguments before execution. Completed calls have `id`, `name`,
 Use `assistant_message(response)` and `tool_result(call, value)` to append a
 completed tool turn to your messages. `user_message` and `system_message` are
 also available. Responses-mode reasoning items are carried by
-`assistant_message` for replay. See [the full tool dialog](examples/tools.py).
+`assistant_message` for replay. See [the full tool dialog](https://github.com/fl-grtg/llm-sdk/blob/main/examples/tools.py).
 
 ## Images, audio, video and files
 
@@ -220,13 +220,13 @@ python -m ruff check .
 python -m build
 ```
 
-Executable examples: [local](examples/local.py), [streaming](examples/streaming.py),
-[structured output](examples/structured.py), [tool dialog](examples/tools.py).
+Executable examples: [local](https://github.com/fl-grtg/llm-sdk/blob/main/examples/local.py), [streaming](https://github.com/fl-grtg/llm-sdk/blob/main/examples/streaming.py),
+[structured output](https://github.com/fl-grtg/llm-sdk/blob/main/examples/structured.py), [tool dialog](https://github.com/fl-grtg/llm-sdk/blob/main/examples/tools.py).
 Set `LLM_MODEL`, optionally `LLM_BASE_URL` and `LLM_API_KEY`, then run e.g.
 `python examples/local.py`. Never commit API keys.
 
-See [compatibility and manual checks](COMPATIBILITY.md) and [release notes](CHANGELOG.md).
-Measured live results and endpoint limitations are in [LIVE_TEST_REPORT.md](LIVE_TEST_REPORT.md).
+See [compatibility and manual checks](https://github.com/fl-grtg/llm-sdk/blob/main/COMPATIBILITY.md) and [release notes](https://github.com/fl-grtg/llm-sdk/blob/main/CHANGELOG.md).
+Measured live results and endpoint limitations are in [LIVE_TEST_REPORT.md](https://github.com/fl-grtg/llm-sdk/blob/main/LIVE_TEST_REPORT.md).
 Opt-in live contracts in `tests/test_live.py` exercise configured Chat and
 Responses endpoints, including tool replay, images, concurrency and cleanup.
 They are skipped unless `LLM_SDK_LIVE=1`; see COMPATIBILITY.md for configuration.

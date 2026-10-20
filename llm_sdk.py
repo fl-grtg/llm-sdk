@@ -1437,7 +1437,7 @@ class SchemaConverter:
                 return expand(resolved, seen | {ref})
             result = {}
             for key, item in value.items():
-                if key == "$defs":
+                if key in ("$defs", "discriminator"):
                     continue
                 if key in ("properties", "patternProperties", "dependentSchemas"):
                     result[key] = {name: expand(child, seen) for name, child in item.items()}
@@ -1596,6 +1596,11 @@ class SchemaConverter:
         if not isinstance(schema, dict):
             return
         properties = schema.get("properties")
+        if (schema.get("type") == "object" or isinstance(properties, dict)) and schema.get("additionalProperties") is not False:
+            raise SchemaConversionError(
+                f"Strict schema{f' for {context}' if context else ''}: objects must set "
+                f"additionalProperties: false (at {path})"
+            )
         if isinstance(properties, dict):
             required = schema.get("required")
             if not isinstance(required, list) or set(required) != set(properties):
@@ -1603,22 +1608,16 @@ class SchemaConverter:
                     f"Strict schema{f' for {context}' if context else ''}: 'required' must be "
                     f"an array including every key in 'properties' (at {path})"
                 )
-            if schema.get("additionalProperties") is not False:
-                raise SchemaConversionError(
-                    f"Strict schema{f' for {context}' if context else ''}: objects must set "
-                    f"additionalProperties: false (at {path})"
-                )
             for key, sub_schema in properties.items():
                 cls._validate_strict_schema(sub_schema, path=f"{path}.{key}", context=context)
+        for key, sub_schema in (schema.get("$defs") or {}).items():
+            cls._validate_strict_schema(sub_schema, path=f"{path}.$defs.{key}", context=context)
         items = schema.get("items")
         if isinstance(items, dict):
             cls._validate_strict_schema(items, path=f"{path}.items", context=context)
-        for sub_schema in schema.get("prefixItems", []) or []:
-            if isinstance(sub_schema, dict):
-                cls._validate_strict_schema(sub_schema, path=f"{path}.prefixItems[]", context=context)
-        for sub_schema in schema.get("anyOf", []) or []:
-            if isinstance(sub_schema, dict):
-                cls._validate_strict_schema(sub_schema, path=f"{path}.anyOf[]", context=context)
+        for keyword in ("prefixItems", "anyOf", "oneOf", "allOf"):
+            for sub_schema in schema.get(keyword, []) or []:
+                cls._validate_strict_schema(sub_schema, path=f"{path}.{keyword}[]", context=context)
 
     def convert_class_to_schema(
         self,
@@ -1643,6 +1642,7 @@ class SchemaConverter:
         if callable(getattr(schema_class, "model_json_schema", None)):
             if strict:
                 schema = pydantic_function_tool(schema_class)["function"]["parameters"]
+                self._validate_strict_schema(schema, context=schema_class.__name__)
             else:
                 schema = schema_class.model_json_schema()
             return {
@@ -3585,6 +3585,13 @@ class ToolCallStreamHandler:
             # redirect instead of reopening the first call.
             key: Key = self._index_redirect.get(idx, ("index", idx))
             pending = self._pending.get(key)
+            function = getattr(tc, "function", None)
+            incoming_name = getattr(function, "name", None)
+            if pending is not None and not tid and not pending["id"] and incoming_name and pending["name"] and incoming_name != pending["name"]:
+                key = ("fallback", self._next_fallback_index)
+                self._next_fallback_index += 1
+                self._index_redirect[idx] = key
+                return key, True
             if pending is not None and tid and pending["id"] and tid != pending["id"]:
                 # Constant index for parallel calls: open a new key by id.
                 key = ("id", tid)

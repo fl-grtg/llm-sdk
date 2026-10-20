@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 from types import SimpleNamespace
+from typing import Annotated, Literal
 
 import httpx
 import openai
@@ -23,6 +24,19 @@ class Detail(BaseModel):
 
 class Node(BaseModel):
     child: "Node | None" = None
+
+
+class MapOutput(BaseModel):
+    meta: dict[str, str]
+
+
+class ExtraOutput(BaseModel):
+    model_config = {"extra": "allow"}
+    value: str
+
+
+class NestedMapOutput(BaseModel):
+    nested: MapOutput
 
 
 def test_pydantic_refs_are_resolved_when_embedded_in_plain_classes():
@@ -70,6 +84,26 @@ def test_recursive_pydantic_is_supported_at_root_but_rejected_when_embedded():
 
     with pytest.raises(sdk.SchemaConversionError, match="Recursive schemas"):
         converter.convert_class_to_schema(Output)
+
+
+def test_embedded_discriminated_union_does_not_keep_dangling_mapping_refs():
+    class Cat(BaseModel):
+        kind: Literal["cat"]
+
+    class Dog(BaseModel):
+        kind: Literal["dog"]
+
+    class Zoo(BaseModel):
+        pet: Annotated[Cat | Dog, Field(discriminator="kind")]
+
+    class Output:
+        zoo: Zoo
+
+    schema = sdk.SchemaConverter().convert_class_to_schema(Output)["json_schema"]["schema"]
+    variants = schema["properties"]["zoo"]["properties"]["pet"]["oneOf"]
+    assert [v["properties"]["kind"]["const"] for v in variants] == ["cat", "dog"]
+    assert '"discriminator"' not in json.dumps(schema)
+    assert '"#/$defs/' not in json.dumps(schema)
 
 
 def sse(responses, text='{"rating":2}', usage=True):
@@ -122,6 +156,30 @@ def request_model(responses, asynchronous, stream, **kwargs):
         if stream:
             return list(llm.stream_response(input="hi", final=True, **kwargs))
         return llm.response(input="hi", **kwargs)
+
+
+@pytest.mark.parametrize("responses", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", [MapOutput, ExtraOutput, NestedMapOutput])
+def test_invalid_strict_pydantic_schemas_fail_before_network(server, responses, asynchronous, stream, model):
+    with pytest.raises(sdk.SchemaConversionError, match="additionalProperties: false"):
+        request_model(responses, asynchronous, stream, output_format=model)
+    assert server["requests"] == []
+
+
+@pytest.mark.parametrize("model", [MapOutput, ExtraOutput, NestedMapOutput])
+def test_non_strict_pydantic_keeps_open_object_schemas(model):
+    converted = sdk.SchemaConverter().convert_class_to_schema(model, strict=False)
+    assert converted["json_schema"]["strict"] is False
+    assert "additionalProperties" in json.dumps(converted)
+
+
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf", "allOf"])
+def test_raw_strict_combinations_reject_open_objects(keyword):
+    schema = {keyword: [{"type": "object", "additionalProperties": {"type": "string"}}]}
+    with pytest.raises(sdk.SchemaConversionError, match="additionalProperties: false"):
+        sdk.SchemaConverter._validate_strict_schema(schema)
 
 
 @pytest.mark.parametrize("responses", [False, True])
@@ -265,6 +323,19 @@ def test_different_tools_without_ids_do_not_merge_incomplete_arguments():
     assert [(c["name"], c["arguments"]) for c in calls] == [
         ("first", {"_raw": '{"a":'}), ("second", {"b": 2}),
     ]
+
+
+def test_constant_tool_index_without_ids_splits_names_and_redirects_later_deltas():
+    handler = sdk.ToolCallStreamHandler(sdk.EventBuilder())
+    handler.process_chunk([SimpleNamespace(index=0, function=SimpleNamespace(name="first", arguments='{"a":1}'))])
+    handler.process_chunk([SimpleNamespace(index=0, function=SimpleNamespace(name="second", arguments='{"b":'))])
+    handler.process_chunk([SimpleNamespace(index=0, function=SimpleNamespace(name=None, arguments='2}'))])
+    handler.finalize()
+    calls = handler.get_all_calls()
+    assert [(c["name"], c["arguments"]) for c in calls] == [
+        ("first", {"a": 1}), ("second", {"b": 2}),
+    ]
+    assert calls[0]["id"] != calls[1]["id"]
 
 
 def test_responses_idless_items_keep_their_own_arguments_and_call_ids():
