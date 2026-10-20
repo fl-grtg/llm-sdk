@@ -677,17 +677,21 @@ class LLMSDKTests(unittest.TestCase):
 
         from llm_sdk import ImageProcessor
 
-        img = Image.new("RGB", (300, 200), (5, 6, 7))
+        img = Image.new("RGB", (1200, 800), (5, 6, 7))
         buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
+        img.save(buffer, format="PNG", compress_level=0)
         data = base64.b64encode(buffer.getvalue()).decode()
         old = ImageProcessor._MAX_IMAGE_SEND_BYTES
-        ImageProcessor._MAX_IMAGE_SEND_BYTES = 100
+        ImageProcessor._MAX_IMAGE_SEND_BYTES = 5000
         try:
             item = ImageProcessor._from_base64(data)
             self.assertTrue(
                 item["image_url"]["url"].startswith("data:image/jpeg;base64,")
             )
+            raw = base64.b64decode(item["image_url"]["url"].split(",", 1)[1])
+            self.assertLessEqual(len(raw), 5000)
+            with Image.open(io.BytesIO(raw)) as out:
+                self.assertLess(max(out.size), 1200)
         finally:
             ImageProcessor._MAX_IMAGE_SEND_BYTES = old
 
@@ -2024,12 +2028,12 @@ class ToolPreparatorTests(unittest.TestCase):
 class RequestTransformerTests(unittest.TestCase):
     """F-06/F-08/F-15/C-01/C-04/C-08: request normalization and parameters."""
 
-    def test_max_tokens_mapped_for_reasoning_models(self):
+    def test_max_tokens_mapped_only_for_openai_host(self):
         from llm_sdk import RequestTransformer
 
         cases = [
-            ("o4-mini", "http://localhost:1234/v1", "max_completion_tokens"),
-            ("gpt-5.5", "http://localhost:1234/v1", "max_completion_tokens"),
+            ("o4-mini", "http://localhost:1234/v1", "max_tokens"),
+            ("gpt-5.5", "http://localhost:1234/v1", "max_tokens"),
             ("qwen3", "http://localhost:1234/v1", "max_tokens"),
             ("qwen3", "https://api.openai.com/v1", "max_completion_tokens"),
         ]
@@ -2039,31 +2043,14 @@ class RequestTransformerTests(unittest.TestCase):
                 kwargs = transformer.transform({"max_tokens": 100})
                 self.assertEqual(kwargs, {expected_key: 100})
 
-    def test_stop_and_temperature_dropped_for_reasoning_models(self):
+    def test_explicit_sampling_parameters_are_preserved(self):
         from llm_sdk import RequestTransformer
 
-        o_series = RequestTransformer("o3-mini", "https://api.openai.com/v1")
-        kwargs = o_series.transform({"stop": ["END"], "temperature": 0.5, "top_p": 0.9})
-        self.assertNotIn("stop", kwargs)
-        self.assertNotIn("temperature", kwargs)
-        self.assertNotIn("top_p", kwargs)
-
-        gpt5 = RequestTransformer("gpt-5", "https://api.openai.com/v1")
-        kwargs5 = gpt5.transform({"stop": ["END"], "temperature": 0.5})
-        self.assertNotIn("stop", kwargs5)
-        self.assertNotIn("temperature", kwargs5)
-
-        local = RequestTransformer("qwen3", "http://localhost:1234/v1")
-        kwargs_local = local.transform({"stop": ["END"], "temperature": 0.5})
-        self.assertEqual(kwargs_local["stop"], ["END"])
-        self.assertEqual(kwargs_local["temperature"], 0.5)
-
-        # Host-gated: a local model merely named like an OpenAI reasoning
-        # model keeps its parameters.
-        local_o3 = RequestTransformer("o3-locally-hosted", "http://localhost:1234/v1")
-        kwargs_local_o3 = local_o3.transform({"stop": ["END"], "temperature": 0.5})
-        self.assertEqual(kwargs_local_o3["stop"], ["END"])
-        self.assertEqual(kwargs_local_o3["temperature"], 0.5)
+        for model in ("o3-mini", "gpt-5", "gpt-6", "qwen3"):
+            for base in ("https://api.openai.com/v1", "http://localhost:1234/v1"):
+                with self.subTest(model=model, base=base):
+                    params = {"stop": ["END"], "temperature": 0.5, "top_p": 0.9}
+                    self.assertEqual(RequestTransformer(model, base).transform(dict(params)), params)
 
     def test_reasoning_effort_type_checked_and_unknown_warns(self):
         import logging
@@ -5164,7 +5151,7 @@ class AuditFixTests(unittest.TestCase):
         out = llm._translate_content_for_responses_api(
             [{"type": "file", "file": {"file_data": "aGk="}}]
         )
-        self.assertEqual(out[0]["file_data"], "aGk=")
+        self.assertEqual(out[0]["file_data"], "data:application/octet-stream;base64,aGk=")
 
     def test_translate_input_audio_validated(self):
         from unittest import mock
@@ -5777,7 +5764,7 @@ class AuditFixTests(unittest.TestCase):
         kinds = [item.get("type", item.get("role")) for item in out]
         self.assertEqual(kinds, ["reasoning", "assistant", "function_call"])
 
-    def test_reasoning_unterminated_respects_opt_out(self):
+    def test_reasoning_unterminated_flag_survives_content_opt_out(self):
         from types import SimpleNamespace
 
         llm = self._llm()
@@ -5796,7 +5783,7 @@ class AuditFixTests(unittest.TestCase):
             llm.stream_response(input="x", final=True, include_reasoning=False)
         )
         final = next(e for e in events if e["type"] == "final")
-        self.assertNotIn("reasoning_unterminated", final["content"])
+        self.assertTrue(final["content"]["reasoning_unterminated"])
         self.assertNotIn("reasoning", final["content"])
 
     def test_reasoning_unterminated_responses(self):
