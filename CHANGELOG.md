@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.1.0 — unreleased
+## 2.1.0
 
 Stabilize the existing inference API without introducing another framework or
 additional runtime dependencies.
