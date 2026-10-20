@@ -42,8 +42,8 @@ and drops it).
 Stream events are small dicts with ``type`` and ``content`` keys:
 ``answer``, ``reasoning``, ``refusal``, ``tool_call``, ``tool_call_part``,
 ``verbose``, ``final``, ``done``. Inference generators are lazy: the HTTP
-request starts at the first ``next()``. Breaking out of a stream early aborts
-the request and releases the connection.
+request starts at the first ``next()``. On early exit, close the generator
+with ``close()`` / ``await aclose()`` to release the connection promptly.
 
 A ``LLM`` instance keeps no per-request state (parsers and handlers are
 created per call), so instances are safe to share between threads and tasks.
@@ -98,7 +98,7 @@ from typing import (
 from urllib.parse import parse_qsl, urlencode, urlparse
 from uuid import UUID
 
-from openai import APIError, AsyncOpenAI, OpenAI
+from openai import APIError, AsyncOpenAI, OpenAI, pydantic_function_tool
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
@@ -136,7 +136,7 @@ def configure_debug_logging() -> None:
 DEFAULT_API_KEY: Final[str] = "lm-studio"
 DEFAULT_BASE_URL: Final[str] = "http://localhost:1234/v1"
 DEFAULT_TIMEOUT: Final[float] = 300.0
-__version__: Final[str] = "2.0.1"
+__version__: Final[str] = "2.1.0"
 
 MessageList = list[dict[str, Any]]
 
@@ -510,7 +510,7 @@ def _resolve_token_metrics(
 ) -> tuple[int, Optional[int]]:
     """Resolve token counts; falls back to the chunk count only for `tokens`."""
     tokens = completion_tokens if completion_tokens is not None else chunks
-    if total_tokens is None and prompt_tokens is not None:
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
         total_tokens = prompt_tokens + tokens
     return tokens, total_tokens
 
@@ -521,7 +521,10 @@ def _decode_tokens_per_second(
     elapsed: float,
     tokens: int,
 ) -> float:
-    """Decode throughput over the chunk window (excludes TTFT and consumer time)."""
+    """Throughput over the chunk window, or the full request for one chunk.
+
+    Includes time spent by the consumer between chunks.
+    """
     decode_seconds = (
         t_last - t_first
         if t_first is not None and t_last is not None and t_last > t_first
@@ -546,6 +549,7 @@ def _parse_structured_output(
     strict: bool,
     refusal: str = "",
     has_tool_calls: bool = False,
+    output_model: Optional[type] = None,
 ) -> Any:
     if refusal:
         if strict:
@@ -568,12 +572,15 @@ def _parse_structured_output(
         return None
     cleaned = _strip_json_fences(answer)
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        if output_model is not None:
+            output_model.model_validate_json(cleaned, strict=True)
+        return parsed
     except (ValueError, TypeError, RecursionError) as e:
         if strict:
             hint = " (output was truncated; increase the token limit)" if stop_reason == "length" else ""
             raise StructuredOutputError(
-                f"Model did not return valid JSON for the requested output format: {e}{hint}",
+                f"Model did not return valid JSON matching the requested output format: {_redact_url_credentials(str(e))}{hint}",
                 raw=answer,
                 stop_reason=stop_reason,
             ) from e
@@ -946,6 +953,7 @@ class FinalResponse(TypedDict, total=False):
     reasoning_unterminated: bool
     tool_calls: list[ToolCall]
     response_items: list[dict[str, Any]]
+    usage: dict[str, Optional[int]]
     verbose: VerboseInfo
     stop_reason: Optional[str]
 
@@ -1392,7 +1400,10 @@ class SchemaConverter:
             nested_schema = self.convert_class_to_schema(
                 python_type, seen_models=seen_models, strict=strict
             )
-            return nested_schema["json_schema"]["schema"]
+            schema = nested_schema["json_schema"]["schema"]
+            if "$defs" in schema or "$ref" in schema:
+                schema = self._inline_local_refs(schema)
+            return schema
 
         raise SchemaConversionError(
             f"Cannot map {python_type!r} to JSON schema. Supported: bool/int/float/str, "
@@ -1400,6 +1411,45 @@ class SchemaConverter:
             "unions, datetime/date/time, UUID, Decimal, Path, bytes, Any, NamedTuple, "
             "and annotated classes."
         )
+
+    @staticmethod
+    def _inline_local_refs(schema: dict[str, Any]) -> dict[str, Any]:
+        # A Pydantic schema embedded inside a plain class or tool parameter
+        # loses its root $defs scope. Inline its references before embedding.
+        definitions = schema.get("$defs", {})
+
+        def expand(value: Any, seen: frozenset[str]) -> Any:
+            if not isinstance(value, dict):
+                return value
+            if "$ref" in value:
+                ref = value["$ref"]
+                if not isinstance(ref, str) or not ref.startswith("#/$defs/"):
+                    raise SchemaConversionError(f"Cannot resolve embedded schema reference {ref!r}")
+                if ref in seen:
+                    raise SchemaConversionError(
+                        "Recursive schemas embedded in plain classes or tool parameters are unsupported; "
+                        "use a Pydantic output model at the root"
+                    )
+                name = ref.removeprefix("#/$defs/").replace("~1", "/").replace("~0", "~")
+                if name not in definitions:
+                    raise SchemaConversionError(f"Cannot resolve embedded schema reference {ref!r}")
+                resolved = {**definitions[name], **{k: v for k, v in value.items() if k != "$ref"}}
+                return expand(resolved, seen | {ref})
+            result = {}
+            for key, item in value.items():
+                if key in ("$defs", "discriminator"):
+                    continue
+                if key in ("properties", "patternProperties", "dependentSchemas"):
+                    result[key] = {name: expand(child, seen) for name, child in item.items()}
+                elif key in ("anyOf", "allOf", "oneOf", "prefixItems"):
+                    result[key] = [expand(child, seen) for child in item]
+                elif key in ("items", "additionalProperties", "not", "if", "then", "else", "contains", "propertyNames"):
+                    result[key] = expand(item, seen)
+                else:
+                    result[key] = item
+            return result
+
+        return expand(schema, frozenset())
 
     def _is_annotated_class(self, python_type: Any) -> bool:
         if not isinstance(python_type, type):
@@ -1516,32 +1566,6 @@ class SchemaConverter:
                 )
             return fields_map
 
-        # Pydantic v2 models keep defaults/descriptions in model_fields.
-        model_fields = getattr(schema_class, "model_fields", None)
-        if isinstance(model_fields, dict) and not is_dataclass(schema_class):
-            for name, hint_annotation in hints.items():
-                field_info = model_fields.get(name)
-                annotation = hint_annotation
-                optional = False
-                description = None
-                if field_info is not None:
-                    # Prefer the resolved field annotation (handles aliases
-                    # and forward refs better than get_type_hints alone).
-                    field_annotation = getattr(field_info, "annotation", None)
-                    if field_annotation is not None:
-                        annotation = field_annotation
-                    try:
-                        optional = not field_info.is_required()
-                    except Exception:
-                        optional = False
-                    description = getattr(field_info, "description", None)
-                fields_map[name] = _SchemaField(
-                    annotation=annotation,
-                    optional=optional,
-                    description=description if isinstance(description, str) else None,
-                )
-            return fields_map
-
         # Plain class: walk the MRO so inherited defaults are found.
         defaults: dict[str, Any] = {}
         for base in reversed(schema_class.__mro__):
@@ -1572,6 +1596,11 @@ class SchemaConverter:
         if not isinstance(schema, dict):
             return
         properties = schema.get("properties")
+        if (schema.get("type") == "object" or isinstance(properties, dict)) and schema.get("additionalProperties") is not False:
+            raise SchemaConversionError(
+                f"Strict schema{f' for {context}' if context else ''}: objects must set "
+                f"additionalProperties: false (at {path})"
+            )
         if isinstance(properties, dict):
             required = schema.get("required")
             if not isinstance(required, list) or set(required) != set(properties):
@@ -1579,22 +1608,16 @@ class SchemaConverter:
                     f"Strict schema{f' for {context}' if context else ''}: 'required' must be "
                     f"an array including every key in 'properties' (at {path})"
                 )
-            if schema.get("additionalProperties") is not False:
-                raise SchemaConversionError(
-                    f"Strict schema{f' for {context}' if context else ''}: objects must set "
-                    f"additionalProperties: false (at {path})"
-                )
             for key, sub_schema in properties.items():
                 cls._validate_strict_schema(sub_schema, path=f"{path}.{key}", context=context)
+        for key, sub_schema in (schema.get("$defs") or {}).items():
+            cls._validate_strict_schema(sub_schema, path=f"{path}.$defs.{key}", context=context)
         items = schema.get("items")
         if isinstance(items, dict):
             cls._validate_strict_schema(items, path=f"{path}.items", context=context)
-        for sub_schema in schema.get("prefixItems", []) or []:
-            if isinstance(sub_schema, dict):
-                cls._validate_strict_schema(sub_schema, path=f"{path}.prefixItems[]", context=context)
-        for sub_schema in schema.get("anyOf", []) or []:
-            if isinstance(sub_schema, dict):
-                cls._validate_strict_schema(sub_schema, path=f"{path}.anyOf[]", context=context)
+        for keyword in ("prefixItems", "anyOf", "oneOf", "allOf"):
+            for sub_schema in schema.get(keyword, []) or []:
+                cls._validate_strict_schema(sub_schema, path=f"{path}.{keyword}[]", context=context)
 
     def convert_class_to_schema(
         self,
@@ -1615,6 +1638,21 @@ class SchemaConverter:
             raise SchemaConversionError(
                 f"output_format class must be a class, got {schema_class!r}"
             )
+
+        if callable(getattr(schema_class, "model_json_schema", None)):
+            if strict:
+                schema = pydantic_function_tool(schema_class)["function"]["parameters"]
+                self._validate_strict_schema(schema, context=schema_class.__name__)
+            else:
+                schema = schema_class.model_json_schema()
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": name or schema_class.__name__,
+                    "strict": strict,
+                    "schema": schema,
+                },
+            }
 
         hints = self._class_type_hints(schema_class)
         if not hints:
@@ -2092,17 +2130,14 @@ class RequestTransformer:
     _KNOWN_REASONING_EFFORTS: ClassVar[frozenset[str]] = frozenset(
         {"minimal", "low", "medium", "high", "none", "xhigh"}
     )
-    _REASONING_MODEL_RE: ClassVar[re.Pattern] = re.compile(r"^(o\d|gpt-5)", re.IGNORECASE)
 
     def __init__(self, model: str, api_base: str):
-        self._model = model
         self._api_base = api_base.lower()
         self._warned: set[str] = set()
 
     def transform(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         self._validate_reasoning_effort(kwargs)
         self._normalize_max_tokens(kwargs)
-        self._drop_reasoning_model_conflicts(kwargs)
         self._normalize_reasoning(kwargs)
         return kwargs
 
@@ -2134,33 +2169,11 @@ class RequestTransformer:
             )
 
     def _normalize_max_tokens(self, kwargs: dict[str, Any]) -> None:
-        """Map max_tokens to max_completion_tokens where required (o-series/gpt-5, OpenAI)."""
+        """Use OpenAI's token-limit field without guessing from model names."""
         if "max_tokens" not in kwargs:
             return
-        if self._on_openai_host() or self._REASONING_MODEL_RE.match(self._model):
+        if self._on_openai_host():
             kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
-
-    def _drop_reasoning_model_conflicts(self, kwargs: dict[str, Any]) -> None:
-        # Host-gated: a local vLLM model merely named "o3-..." keeps its
-        # parameters; only api.openai.com enforces the reasoning-model rules.
-        if not self._on_openai_host():
-            return
-        if not self._REASONING_MODEL_RE.match(self._model):
-            return
-        if kwargs.pop("stop", None) is not None:
-            self._warn_once(
-                "stop",
-                "Dropping 'stop': not supported by reasoning model %r on api.openai.com",
-                self._model,
-            )
-        for key in ("temperature", "top_p"):
-            if kwargs.pop(key, None) is not None:
-                self._warn_once(
-                    f"drop:{key}",
-                    "Dropping %r: not supported by reasoning model %r on api.openai.com",
-                    key,
-                    self._model,
-                )
 
     def _normalize_reasoning(self, kwargs: dict[str, Any]) -> None:
         """Map the reasoning pair onto the single Chat wire format.
@@ -2242,11 +2255,6 @@ class ImageProcessor:
                     "upgrade with: pip install -U Pillow"
                 )
             cls._pil_image = Image
-            # Defense in depth: Pillow's own bomb guard matches our 100MP
-            # header check, so races/quirks in header parsing can't allocate
-            # gigapixel buffers (raised as DecompressionBombError, wrapped
-            # into ImageProcessingError by the callers below).
-            Image.MAX_IMAGE_PIXELS = ImageProcessor._MAX_IMAGE_PIXELS
         return cls._pil_image
 
     @staticmethod
@@ -2711,7 +2719,7 @@ class ImageProcessor:
                     original_size, working.size,
                 )
             if len(payload) > ImageProcessor._MAX_IMAGE_SEND_BYTES:
-                logger.debug(
+                raise ImageProcessingError(
                     "Image payload still exceeds send budget after downscaling"
                 )
             encoded = base64.b64encode(payload).decode("utf-8")
@@ -3199,9 +3207,25 @@ class FileProcessor:
     def _convert_file_item(item: dict) -> dict:
         detail = _validate_detail(item.get("detail"), what="file detail")
         if "file" in item:
-            # Already converted (converters share the "file" type): keep
-            # builders idempotent instead of reprocessing wire parts.
-            return item
+            part = item["file"]
+            if not isinstance(part, dict):
+                raise ConfigurationError("file must be an object")
+            detail = _validate_detail(part.get("detail", detail), what="file detail")
+            filename = part.get("filename")
+            sources = [key for key in ("file_id", "file_data", "file_url") if part.get(key) is not None]
+            if len(sources) != 1:
+                raise ConfigurationError("file needs exactly one of file_id, file_data or file_url")
+            if sources[0] == "file_id":
+                return FileProcessor._from_file_id(part["file_id"], filename=filename, detail=detail)
+            data = part[sources[0]]
+            if sources[0] == "file_url" or (
+                isinstance(data, str) and data.lower().startswith(("http://", "https://"))
+            ):
+                return FileProcessor._from_url(data, filename=filename, detail=detail)
+            try:
+                return FileProcessor._from_base64(data, filename=filename, detail=detail)
+            except FileProcessingError as e:
+                raise ConfigurationError(str(e)) from e
         if "file_path" in item:
             return FileProcessor._from_path(
                 item["file_path"],
@@ -3561,6 +3585,13 @@ class ToolCallStreamHandler:
             # redirect instead of reopening the first call.
             key: Key = self._index_redirect.get(idx, ("index", idx))
             pending = self._pending.get(key)
+            function = getattr(tc, "function", None)
+            incoming_name = getattr(function, "name", None)
+            if pending is not None and not tid and not pending["id"] and incoming_name and pending["name"] and incoming_name != pending["name"]:
+                key = ("fallback", self._next_fallback_index)
+                self._next_fallback_index += 1
+                self._index_redirect[idx] = key
+                return key, True
             if pending is not None and tid and pending["id"] and tid != pending["id"]:
                 # Constant index for parallel calls: open a new key by id.
                 key = ("id", tid)
@@ -3590,6 +3621,10 @@ class ToolCallStreamHandler:
             active = self._pending[self._active_key]
             function = getattr(tc, "function", None)
             incoming_name = getattr(function, "name", None) if function is not None else None
+            if incoming_name and active["name"] and incoming_name != active["name"]:
+                key = ("fallback", self._next_fallback_index)
+                self._next_fallback_index += 1
+                return key, False
             if incoming_name and active["name"] and active["arguments"]:
                 try:
                     json.loads(active["arguments"])
@@ -3765,6 +3800,7 @@ class _ChatStreamState:
         include_reasoning: bool,
         event_builder: EventBuilder,
         start_time: float,
+        output_model: Optional[type] = None,
     ):
         self._parser = parser
         self._tool_handler = tool_handler
@@ -3772,6 +3808,7 @@ class _ChatStreamState:
         self._include_reasoning = include_reasoning
         self._event_builder = event_builder
         self._start_time = start_time
+        self._output_model = output_model
 
         self.reasoning = ""
         self.answer = ""
@@ -3840,7 +3877,7 @@ class _ChatStreamState:
                 else:
                     part_type = getattr(part, "type", None)
                     part_text = getattr(part, "text", None)
-                if part_type in (None, "text") and isinstance(part_text, str) and part_text:
+                if part_type in (None, "text", "output_text") and isinstance(part_text, str) and part_text:
                     parts.append(part_text)
             text = "".join(parts)
         if text:
@@ -3878,6 +3915,9 @@ class _ChatStreamState:
         # fail JSON parsing of an (correctly) empty answer.
         pending_calls = self._tool_handler.finalize()
 
+        if self.stop_reason is None and not (self.answer.strip() or self.refusal or self._tool_handler.get_all_calls()):
+            raise ModelRequestError("Model stream ended before an answer, completed tool call or terminal status was received")
+
         answer: Any = self.answer
         if self._structured_output:
             answer = _parse_structured_output(
@@ -3886,6 +3926,7 @@ class _ChatStreamState:
                 strict=True,
                 refusal=self.refusal,
                 has_tool_calls=bool(pending_calls or self._tool_handler.get_all_calls()),
+                output_model=self._output_model,
             )
             events.append(self._event_builder.answer(answer))
 
@@ -3915,12 +3956,19 @@ class _ChatStreamState:
             events.append(self._event_builder.verbose(verbose_info))
 
         if final:
-            final_response: FinalResponse = {"answer": answer}
+            final_response: FinalResponse = {
+                "answer": answer,
+                "usage": {
+                    "prompt_tokens": self.prompt_tokens,
+                    "completion_tokens": self.completion_tokens,
+                    "total_tokens": total_tokens,
+                },
+            }
             if self._include_reasoning and self.reasoning:
                 final_response["reasoning"] = self.reasoning
             if self.refusal:
                 final_response["refusal"] = self.refusal
-            if self._parser.is_inside_reasoning and self._include_reasoning:
+            if self._parser.is_inside_reasoning:
                 final_response["reasoning_unterminated"] = True
             all_completed_calls = self._tool_handler.get_all_calls()
             if all_completed_calls:
@@ -4541,103 +4589,11 @@ class LLM:
                     "video is not supported by the Responses API; use chat completions"
                 )
             elif item_type == "file":
-                file_data = item.get("file")
-                if not isinstance(file_data, dict):
-                    raise ConfigurationError(
-                        "file items need a 'file' object with filename and file_data"
-                    )
-                file_id_value = file_data.get("file_id")
-                file_data_value = file_data.get("file_data", "")
-                detail_value = file_data.get("detail")
-                filename_value = file_data.get("filename", "file")
-                if filename_value is None:
-                    filename_value = "file"
-                if filename_value is not None and (
-                    not isinstance(filename_value, str)
-                    or len(filename_value) > 1024
-                ):
-                    raise ConfigurationError(
-                        "file filename must be a string of at most 1024 characters"
-                    )
-                if not filename_value:
-                    filename_value = "file"
-                _reject_confusable_controls(filename_value, what="file filename")
-                file_item: dict[str, Any] = {
-                    "type": "input_file",
-                    "filename": filename_value,
-                }
-                if file_id_value is not None:
-                    if not isinstance(file_id_value, str) or not file_id_value.strip():
-                        raise ConfigurationError(
-                            "file file_id must be a non-empty string"
-                        )
-                    file_id_value = file_id_value.strip()
-                    _reject_confusable_controls(file_id_value, what="file file_id")
-                    if len(file_id_value) > 512:
-                        raise ConfigurationError(
-                            "file file_id exceeds the 512-character limit"
-                        )
-                    file_item["file_id"] = file_id_value
-                elif isinstance(file_data_value, str) and file_data_value.lower().startswith(
-                    ("http://", "https://")
-                ):
-                    # input_file accepts file_data, file_id or file_url —
-                    # remote URLs map to file_url, never into file_data.
-                    file_item["file_url"] = _validate_http_url(
-                        file_data_value, what="file file_url"
-                    )
-                elif isinstance(file_data_value, str) and file_data_value:
-                    body = file_data_value
-                    if body[:5].lower() == "data:":
-                        comma_at = body.find(",")
-                        header = body[5:comma_at].split(";")[0].strip().lower()
-                        if "/" not in header:
-                            raise ConfigurationError(
-                                "file file_data data URL has no MIME type"
-                            )
-                        if len(header) > 256:
-                            raise ConfigurationError(
-                                "file file_data data URL MIME exceeds the "
-                                "256-character limit"
-                            )
-                        if FileProcessor._MIME_RE.fullmatch(header) is None:
-                            raise ConfigurationError(
-                                "file file_data data URL MIME is not valid: "
-                                f"{header!r}"
-                            )
-                        after = body[comma_at + 1:]
-                        if not after:
-                            raise ConfigurationError(
-                                "file file_data data URL is malformed"
-                            )
-                        body = after
-                    if len(body) > FileProcessor._MAX_FILE_BASE64_CHARS:
-                        raise ConfigurationError(
-                            "file file_data exceeds the size limit"
-                        )
-                    try:
-                        decoded_file = base64.b64decode(
-                            _strip_b64_whitespace(body), validate=True
-                        )
-                    except ValueError as e:
-                        raise ConfigurationError(
-                            f"file file_data is not valid base64: {e}"
-                        ) from e
-                    if len(decoded_file) > FileProcessor._MAX_FILE_READ_BYTES:
-                        raise ConfigurationError(
-                            "file file_data exceeds the 50MB limit"
-                        )
-                    if len(decoded_file) == 0:
-                        raise ConfigurationError("file file_data is empty")
-                    file_item["file_data"] = file_data_value
-                else:
-                    raise ConfigurationError(
-                        "file items need one of file_id, file_data or a file_url"
-                    )
-                if detail_value is not None:
-                    file_item["detail"] = _validate_detail(
-                        detail_value, what="file detail"
-                    )
+                part = FileProcessor._convert_file_item(item)["file"]
+                file_item = {"type": "input_file", **part}
+                data = file_item.get("file_data")
+                if isinstance(data, str) and data.lower().startswith(("http://", "https://")):
+                    file_item["file_url"] = file_item.pop("file_data")
                 translated.append(file_item)
             elif item_type in ("image", "audio", "video", "audio_base64", "video_base64", "file_base64"):
                 # Pre-normalization shapes must never reach the wire: the
@@ -4667,12 +4623,15 @@ class LLM:
             role = message.get("role")
 
             if role == "tool":
+                call_id = message.get("tool_call_id")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    raise ConfigurationError("Tool results need a non-empty tool_call_id")
                 output = message.get("content")
                 if not isinstance(output, str):
                     output = json.dumps(output, ensure_ascii=False, default=str)
                 items.append({
                     "type": "function_call_output",
-                    "call_id": message.get("tool_call_id", ""),
+                    "call_id": call_id,
                     "output": output,
                 })
                 continue
@@ -4696,13 +4655,19 @@ class LLM:
                     })
                 for tool_call in message.get("tool_calls") or []:
                     function = tool_call.get("function") or {}
+                    call_id = tool_call.get("id")
+                    name = function.get("name")
+                    if not isinstance(call_id, str) or not call_id.strip():
+                        raise ConfigurationError("Assistant tool calls need a non-empty id")
+                    if not isinstance(name, str) or not name.strip():
+                        raise ConfigurationError("Assistant tool calls need a non-empty function name")
                     arguments = function.get("arguments", "{}")
                     if not isinstance(arguments, str):
                         arguments = json.dumps(arguments, ensure_ascii=False, default=str)
                     items.append({
                         "type": "function_call",
-                        "call_id": tool_call.get("id", ""),
-                        "name": function.get("name", ""),
+                        "call_id": call_id,
+                        "name": name,
                         "arguments": arguments,
                     })
                 continue
@@ -4938,7 +4903,9 @@ class LLM:
                     "name": getattr(item, "name", "") or "",
                     "arguments": "",
                 }
-                state["pending_tool_items"][getattr(item, "id", "")] = pending
+                item_id = getattr(item, "id", None)
+                if item_id:
+                    state["pending_tool_items"][item_id] = pending
                 index = self._safe_index(output_index)
                 if index is not None:
                     state["pending_tool_indexes"][index] = pending
@@ -4950,7 +4917,9 @@ class LLM:
             item = getattr(event, "item", None)
             if item and getattr(item, "type", "") == "function_call":
                 item_id = getattr(item, "id", "") or ""
-                call_id = getattr(item, "call_id", None) or item_id
+                index = self._safe_index(getattr(event, "output_index", None))
+                pending = state["pending_tool_items"].get(item_id) or state["pending_tool_indexes"].get(index) or {}
+                call_id = getattr(item, "call_id", None) or pending.get("call_id") or item_id
                 already_completed = (
                     (call_id and call_id in state["completed_call_ids"])
                     or (item_id and item_id in state["completed_item_ids"])
@@ -4958,7 +4927,6 @@ class LLM:
                 if already_completed:
                     state["completed_item_ids"].add(item_id)
                     return emitted
-                pending = state["pending_tool_items"].get(item_id) or {}
                 name = getattr(item, "name", "") or pending.get("name", "")
                 arguments = getattr(item, "arguments", None)
                 if arguments is None or arguments == "":
@@ -4971,6 +4939,8 @@ class LLM:
                     state["completed_call_ids"].add(call_id)
                     state["completed_item_ids"].add(item_id)
                     emitted.append(self._event_builder.tool_call(tool_call))
+                else:
+                    logger.warning("Responses function call completed without a function name")
                 state["pending_tool_items"].pop(item_id, None)
                 output_index = getattr(event, "output_index", None)
                 index = self._safe_index(output_index)
@@ -5041,6 +5011,7 @@ class LLM:
 
             function_name = getattr(event, "name", "") or pending.get("name", "")
             if not function_name:
+                logger.warning("Responses tool arguments completed without a matching function name")
                 return emitted
 
             tool_call = self._complete_responses_tool_call(
@@ -5111,6 +5082,7 @@ class LLM:
         include_reasoning: bool,
         latency: Optional[float],
         elapsed: float,
+        output_model: Optional[type] = None,
     ) -> Generator[StreamEvent, None, None]:
         parser = state["reasoning_parser"]
         if parser is not None:
@@ -5127,6 +5099,9 @@ class LLM:
         if state["refusal"]:
             state["stop_reason"] = "refusal"
 
+        if state["stop_reason"] is None and not (state["answer"].strip() or state["refusal"] or state["completed_tool_calls"]):
+            raise ModelRequestError("Responses stream ended before an answer, completed tool call or terminal status was received")
+
         answer: Any = state["answer"]
         if structured_output:
             answer = _parse_structured_output(
@@ -5135,6 +5110,7 @@ class LLM:
                 strict=True,
                 refusal=state["refusal"],
                 has_tool_calls=bool(state["completed_tool_calls"]),
+                output_model=output_model,
             )
             yield self._event_builder.answer(answer)
 
@@ -5174,12 +5150,19 @@ class LLM:
             yield self._event_builder.verbose(dict(verbose_info))
 
         if final:
-            final_response: FinalResponse = {"answer": answer}
+            final_response: FinalResponse = {
+                "answer": answer,
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                },
+            }
             if include_reasoning and state["reasoning"]:
                 final_response["reasoning"] = state["reasoning"]
             if state["refusal"]:
                 final_response["refusal"] = state["refusal"]
-            if parser is not None and parser.is_inside_reasoning and include_reasoning:
+            if parser is not None and parser.is_inside_reasoning:
                 final_response["reasoning_unterminated"] = True
             if completed_tool_calls:
                 final_response["tool_calls"] = completed_tool_calls
@@ -5284,9 +5267,10 @@ class LLM:
             kwargs["user"] = user
         if tool_choice is not None:
             kwargs["tool_choice"] = self._convert_tool_choice_for_responses(tool_choice)
+        merged_extra_body = _deep_merge_dicts(self._config.extra_body, extra_body)
         if store is not None:
             kwargs["store"] = store
-            if store is False and "include" not in kwargs:
+            if store is False and "include" not in (merged_extra_body or {}):
                 # Unstored reasoning must be requested explicitly to stay
                 # replayable on the next tool turn.
                 kwargs["include"] = ["reasoning.encrypted_content"]
@@ -5295,7 +5279,6 @@ class LLM:
                 "format": self._convert_output_format_for_responses_api(output_format)
             }
 
-        merged_extra_body = _deep_merge_dicts(self._config.extra_body, extra_body)
         if merged_extra_body:
             kwargs["extra_body"] = merged_extra_body
 
@@ -5342,6 +5325,7 @@ class LLM:
         extra_body: Optional[dict],
         max_retries: Optional[int] = None,
         *,
+        output_model: Optional[type] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stop: Optional[Union[str, list[str]]] = None,
@@ -5395,6 +5379,7 @@ class LLM:
         elapsed = time.perf_counter() - start_time
         yield from self._finalize_responses_stream(
             state, structured_output, verbose, final, include_reasoning, latency, elapsed,
+            output_model=output_model,
         )
 
     async def _stream_responses_async(
@@ -5410,6 +5395,7 @@ class LLM:
         extra_body: Optional[dict],
         max_retries: Optional[int] = None,
         *,
+        output_model: Optional[type] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stop: Optional[Union[str, list[str]]] = None,
@@ -5466,6 +5452,7 @@ class LLM:
         elapsed = time.perf_counter() - start_time
         for emitted in self._finalize_responses_stream(
             state, structured_output, verbose, final, include_reasoning, latency, elapsed,
+            output_model=output_model,
         ):
             yield emitted
 
@@ -5529,14 +5516,14 @@ class LLM:
             extra_body: Provider-specific extra fields (must be a dict).
             max_retries: Per-call retry override (``int >= 0``).
         """
-        resolved_messages = _resolve_messages(messages, input, system)
-        output_format = self._prepare_output_format(output_format, strict=schema_strict)
-
         final_content: Optional[FinalResponse] = None
 
         gen = self.stream_response(
-            messages=resolved_messages,
+            messages=messages,
+            input=input,
+            system=system,
             output_format=output_format,
+            schema_strict=schema_strict,
             final=True,
             tools=tools,
             include_reasoning=include_reasoning,
@@ -5609,11 +5596,13 @@ class LLM:
         final event.
         """
         resolved_messages = _resolve_messages(messages, input, system)
+        output_model = output_format if callable(getattr(output_format, "model_validate_json", None)) else None
         output_format = self._prepare_output_format(output_format, strict=schema_strict)
         if self._config.use_responses_api:
             yield from self._stream_responses_sync(
                 messages=resolved_messages,
                 output_format=output_format,
+                output_model=output_model,
                 tools=tools,
                 reasoning_effort=reasoning_effort,
                 reasoning_budget=reasoning_budget,
@@ -5651,6 +5640,7 @@ class LLM:
             include_reasoning=include_reasoning,
             event_builder=self._event_builder,
             start_time=start_time,
+            output_model=output_model,
         )
 
         client = self._client_for(max_retries)
@@ -5717,14 +5707,14 @@ class LLM:
         max_retries: Optional[int] = None,
     ) -> FinalResponse:
         """Async request for model inference (same parameters as ``response``)."""
-        resolved_messages = _resolve_messages(messages, input, system)
-        output_format = self._prepare_output_format(output_format, strict=schema_strict)
-
         final_content: Optional[FinalResponse] = None
 
         agen = self.async_stream_response(
-            messages=resolved_messages,
+            messages=messages,
+            input=input,
+            system=system,
             output_format=output_format,
+            schema_strict=schema_strict,
             final=True,
             tools=tools,
             include_reasoning=include_reasoning,
@@ -5788,11 +5778,13 @@ class LLM:
         response promptly.
         """
         resolved_messages = _resolve_messages(messages, input, system)
+        output_model = output_format if callable(getattr(output_format, "model_validate_json", None)) else None
         output_format = self._prepare_output_format(output_format, strict=schema_strict)
         if self._config.use_responses_api:
-            async for event in self._stream_responses_async(
+            agen = self._stream_responses_async(
                 messages=resolved_messages,
                 output_format=output_format,
+                output_model=output_model,
                 tools=tools,
                 reasoning_effort=reasoning_effort,
                 reasoning_budget=reasoning_budget,
@@ -5809,8 +5801,12 @@ class LLM:
                 user=user,
                 tool_choice=tool_choice,
                 store=store,
-            ):
-                yield event
+            )
+            try:
+                async for event in agen:
+                    yield event
+            finally:
+                await agen.aclose()
             return
 
         kwargs, prepared_tools, structured_output = self._build_request(
@@ -5831,6 +5827,7 @@ class LLM:
             include_reasoning=include_reasoning,
             event_builder=self._event_builder,
             start_time=start_time,
+            output_model=output_model,
         )
 
         client = self._async_client_for(max_retries)
